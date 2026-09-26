@@ -100,6 +100,22 @@ class ProvenanceStore:
                     old_status TEXT NOT NULL, new_status TEXT NOT NULL,
                     note TEXT NOT NULL, created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS deliveries(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    object_id INTEGER NOT NULL REFERENCES objects(id),
+                    claim_id INTEGER NOT NULL REFERENCES claims(id),
+                    recipient TEXT NOT NULL, handover_date TEXT NOT NULL,
+                    note TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK(status IN ('pending','confirmed')),
+                    registered_by TEXT NOT NULL REFERENCES users(id),
+                    confirmed_by TEXT REFERENCES users(id),
+                    created_at TEXT NOT NULL, confirmed_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS delivery_evidence(
+                    delivery_id INTEGER NOT NULL REFERENCES deliveries(id),
+                    evidence_id INTEGER NOT NULL REFERENCES evidence(id),
+                    PRIMARY KEY(delivery_id,evidence_id)
+                );
                 CREATE TABLE IF NOT EXISTS object_versions(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     object_id INTEGER NOT NULL REFERENCES objects(id),
@@ -307,6 +323,107 @@ class ProvenanceStore:
                 conn.rollback()
                 raise
 
+    def _deliveries_for(self, conn, object_id):
+        rows = conn.execute("SELECT * FROM deliveries WHERE object_id=? ORDER BY id", (object_id,)).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["evidence"] = [
+                dict(e) for e in conn.execute(
+                    """SELECT e.id,e.filename,e.sha256,e.size,e.visibility FROM evidence e
+                       JOIN delivery_evidence de ON de.evidence_id=e.id
+                       WHERE de.delivery_id=? ORDER BY e.id""",
+                    (row["id"],),
+                ).fetchall()
+            ]
+            result.append(item)
+        return result
+
+    def register_delivery(self, user_id, object_id, claim_id, recipient, handover_date, note, evidence_ids):
+        recipient, note = recipient.strip(), note.strip()
+        if not recipient:
+            raise BusinessError("受领人不能为空", 422, "invalid_recipient")
+        try:
+            handover = date.fromisoformat(handover_date)
+        except ValueError:
+            raise BusinessError("交接日期必须是 YYYY-MM-DD", 422, "invalid_date")
+        if not evidence_ids:
+            raise BusinessError("交割登记至少关联一份证据", 422, "evidence_required")
+        evidence_ids = list(dict.fromkeys(evidence_ids))
+        with self.connect() as conn:
+            self._user(conn, user_id, {"staff", "reviewer"})
+            obj = self._object(conn, object_id)
+            claim = conn.execute("SELECT * FROM claims WHERE id=? AND object_id=?", (claim_id, object_id)).fetchone()
+            if not claim:
+                raise BusinessError("权利主张不存在", 404, "not_found")
+            if claim["status"] != "resolved_return":
+                raise BusinessError("主张未进入 resolved_return，不能登记交割", 409, "claim_not_resolved")
+            if conn.execute("SELECT 1 FROM deliveries WHERE object_id=? AND status='confirmed'", (object_id,)).fetchone():
+                raise BusinessError("藏品已完成返还交割，不能重复登记", 409, "already_returned")
+            claim_submitted = date.fromisoformat(claim["created_at"][:10])
+            if handover < claim_submitted:
+                raise BusinessError("交接日期不能早于主张提交日期", 422, "invalid_handover_date")
+            for evidence_id in evidence_ids:
+                ev = conn.execute("SELECT * FROM evidence WHERE id=? AND object_id=?", (evidence_id, object_id)).fetchone()
+                if not ev:
+                    raise BusinessError("证据不存在或不属于该藏品", 404, "evidence_not_found")
+                if ev["visibility"] != "internal":
+                    raise BusinessError("交割只能关联内部证据", 422, "evidence_not_internal")
+            cur = conn.execute(
+                """INSERT INTO deliveries(object_id,claim_id,recipient,handover_date,note,registered_by,created_at)
+                   VALUES(?,?,?,?,?,?,?)""",
+                (object_id, claim_id, recipient, handover_date, note, user_id, now()),
+            )
+            delivery_id = cur.lastrowid
+            conn.executemany(
+                "INSERT INTO delivery_evidence(delivery_id,evidence_id) VALUES(?,?)",
+                [(delivery_id, eid) for eid in evidence_ids],
+            )
+            self._audit(conn, object_id, user_id, "delivery.register", {"delivery_id": delivery_id, "claim_id": claim_id, "handover_date": handover_date})
+            return {"id": delivery_id, "object_id": object_id, "claim_id": claim_id, "status": "pending"}
+
+    def confirm_delivery(self, user_id, delivery_id, note):
+        note = note.strip()
+        if len(note) < 5:
+            raise BusinessError("确认审查说明至少 5 字", 422, "review_note_required")
+        with self.connect() as conn:
+            self._user(conn, user_id, {"reviewer"})
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                delivery = conn.execute("SELECT * FROM deliveries WHERE id=?", (delivery_id,)).fetchone()
+                if not delivery:
+                    raise BusinessError("交割单据不存在", 404, "not_found")
+                if delivery["status"] == "confirmed":
+                    # 并发确认时后到者拿到已有结果，不重复变更持有人。
+                    return {"id": delivery_id, "object_id": delivery["object_id"], "status": "confirmed",
+                            "confirmed_by": delivery["confirmed_by"], "already_confirmed": True}
+                if delivery["registered_by"] == user_id:
+                    raise BusinessError("登记人不能确认自己登记的交割单", 403, "self_confirm_forbidden")
+                conn.execute(
+                    "UPDATE deliveries SET status='confirmed',confirmed_by=?,confirmed_at=? WHERE id=?",
+                    (user_id, now(), delivery_id),
+                )
+                obj = self._object(conn, delivery["object_id"])
+                # 持有人只在本次确认时变更一次，并追加一个历史版本。
+                conn.execute(
+                    "UPDATE objects SET current_holder=?,version=?,updated_at=? WHERE id=?",
+                    (delivery["recipient"], obj["version"] + 1, now(), delivery["object_id"]),
+                )
+                self._snapshot(conn, delivery["object_id"], user_id)
+                self._audit(conn, delivery["object_id"], user_id, "delivery.confirm",
+                            {"delivery_id": delivery_id, "recipient": delivery["recipient"], "note": note})
+                return {"id": delivery_id, "object_id": delivery["object_id"], "status": "confirmed",
+                        "confirmed_by": user_id, "object_version": obj["version"] + 1}
+            except Exception:
+                conn.rollback()
+                raise
+
+    def _display_status(self, conn, object_id):
+        confirmed = conn.execute(
+            "SELECT 1 FROM deliveries WHERE object_id=? AND status='confirmed'", (object_id,)
+        ).fetchone()
+        return "已返还" if confirmed else "在藏"
+
     def get_object(self, user_id, object_id):
         with self.connect() as conn:
             user = self._user(conn, user_id)
@@ -322,18 +439,26 @@ class ProvenanceStore:
                 return {
                     "id": obj["id"], "inventory_no": obj["inventory_no"], "title": obj["title"],
                     "object_type": obj["object_type"], "public_summary": obj["public_summary"], "version": obj["version"],
+                    "display_status": self._display_status(conn, object_id),
                     "events": [dict(e) for e in events], "claims": [dict(c) for c in claims],
+                    # 公众只看到交割状态与交接日期；受领人、证据和审查说明不公开。
+                    "deliveries": [
+                        {"id": d["id"], "status": d["status"], "handover_date": d["handover_date"]}
+                        for d in self._deliveries_for(conn, object_id)
+                    ],
                 }
             result = {
                 "id": obj["id"], "inventory_no": obj["inventory_no"], "title": obj["title"],
                 "object_type": obj["object_type"], "current_holder": obj["current_holder"],
                 "public_summary": obj["public_summary"], "version": obj["version"],
+                "display_status": self._display_status(conn, object_id),
                 "events": [dict(x) | {"source": dict(conn.execute("SELECT id,name,source_type,reference FROM sources WHERE id=?", (x["source_id"],)).fetchone()) if x["source_id"] else None,
                                      "evidence": [dict(e) for e in conn.execute("SELECT id,filename,sha256,size,visibility FROM evidence WHERE event_id=? ORDER BY id", (x["id"],)).fetchall()]}
                             for x in conn.execute("SELECT * FROM events WHERE object_id=? ORDER BY id", (object_id,)).fetchall()],
                 "claims": [dict(c) | {"reviews": [dict(r) for r in conn.execute("SELECT * FROM claim_reviews WHERE claim_id=? ORDER BY id", (c["id"],)).fetchall()]}
                            for c in conn.execute("SELECT * FROM claims WHERE object_id=? ORDER BY id", (object_id,)).fetchall()],
                 "unlinked_evidence": [dict(e) for e in conn.execute("SELECT id,filename,sha256,size,visibility FROM evidence WHERE object_id=? AND event_id IS NULL ORDER BY id", (object_id,)).fetchall()],
+                "deliveries": self._deliveries_for(conn, object_id),
             }
             if user["role"] == "claimant":
                 # 主张人只看到公开来源事件和自己的主张，不能浏览内部调查材料。
@@ -342,6 +467,11 @@ class ProvenanceStore:
                 result["claims"] = [c for c in result["claims"] if c["claimant_id"] == user_id]
                 for c in result["claims"]:
                     c.pop("claimant_id", None)
+                # 交割的受领人、证据和审查说明对主张人同样不公开。
+                result["deliveries"] = [
+                    {"id": d["id"], "status": d["status"], "handover_date": d["handover_date"]}
+                    for d in result["deliveries"]
+                ]
             return result
 
     def list_objects(self, user_id):
@@ -351,7 +481,7 @@ class ProvenanceStore:
                 rows = conn.execute("SELECT id,inventory_no,title,object_type,public_summary,version FROM objects ORDER BY id").fetchall()
             else:
                 rows = conn.execute("SELECT * FROM objects ORDER BY id").fetchall()
-            return [dict(r) for r in rows]
+            return [dict(r) | {"display_status": self._display_status(conn, r["id"])} for r in rows]
 
     def object_history(self, user_id, object_id):
         with self.connect() as conn:
@@ -422,10 +552,14 @@ class Handler(BaseHTTPRequestHandler):
                 d = self._body(); return self._send(201, store.upload_evidence(user, object_id, d.get("filename", ""), d.get("content_b64", ""), d.get("visibility", "internal"), d.get("event_id")))
             if len(parts) == 4 and parts[3] == "claims" and method == "POST":
                 d = self._body(); return self._send(201, store.create_claim(user, object_id, d.get("claimed_by", ""), d.get("desired_outcome", "")))
+            if len(parts) == 4 and parts[3] == "deliveries" and method == "POST":
+                d = self._body(); return self._send(201, store.register_delivery(user, object_id, d.get("claim_id"), d.get("recipient", ""), d.get("handover_date", ""), d.get("note", ""), d.get("evidence_ids") or []))
             if len(parts) == 4 and parts[3] == "history" and method == "GET": return self._send(200, {"items": store.object_history(user, object_id)})
             if len(parts) == 5 and parts[3] == "history" and method == "GET": return self._send(200, store.history_detail(user, object_id, int(parts[4])))
         if len(parts) == 4 and parts[:2] == ["api", "claims"] and parts[3] == "transition" and method == "POST":
             d = self._body(); return self._send(200, store.transition_claim(user, int(parts[2]), d.get("status", ""), d.get("note", "")))
+        if len(parts) == 4 and parts[:2] == ["api", "deliveries"] and parts[3] == "confirm" and method == "POST":
+            d = self._body(); return self._send(200, store.confirm_delivery(user, int(parts[2]), d.get("note", "")))
         raise BusinessError("接口不存在", 404, "not_found")
 
     def _handle(self, method):
