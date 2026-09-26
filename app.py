@@ -100,6 +100,24 @@ class ProvenanceStore:
                     old_status TEXT NOT NULL, new_status TEXT NOT NULL,
                     note TEXT NOT NULL, created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS handovers(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    object_id INTEGER NOT NULL REFERENCES objects(id),
+                    claim_id INTEGER NOT NULL REFERENCES claims(id),
+                    recipient TEXT NOT NULL, handover_date TEXT NOT NULL,
+                    note TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK(status IN ('pending','confirmed')),
+                    registered_by TEXT NOT NULL REFERENCES users(id),
+                    confirmed_by TEXT REFERENCES users(id),
+                    confirm_note TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL, confirmed_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS handover_evidence(
+                    handover_id INTEGER NOT NULL REFERENCES handovers(id),
+                    evidence_id INTEGER NOT NULL REFERENCES evidence(id),
+                    PRIMARY KEY(handover_id,evidence_id)
+                );
                 CREATE TABLE IF NOT EXISTS object_versions(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     object_id INTEGER NOT NULL REFERENCES objects(id),
@@ -123,6 +141,7 @@ class ProvenanceStore:
                 [
                     ("staff", "藏品研究员", "staff"),
                     ("reviewer1", "返还审查员", "reviewer"),
+                    ("reviewer2", "返还审查员乙", "reviewer"),
                     ("claimant1", "权利主张人", "claimant"),
                     ("public", "公众访客", "public"),
                 ],
@@ -150,12 +169,26 @@ class ProvenanceStore:
             (object_id, actor, action, json.dumps(detail, ensure_ascii=False, sort_keys=True), now()),
         )
 
+    def _handover_list(self, conn, object_id):
+        rows = conn.execute("SELECT * FROM handovers WHERE object_id=? ORDER BY id", (object_id,)).fetchall()
+        return [
+            dict(h) | {"evidence_ids": [r["evidence_id"] for r in conn.execute(
+                "SELECT evidence_id FROM handover_evidence WHERE handover_id=? ORDER BY evidence_id", (h["id"],)).fetchall()]}
+            for h in rows
+        ]
+
+    def _is_returned(self, conn, object_id):
+        return conn.execute(
+            "SELECT 1 FROM handovers WHERE object_id=? AND status='confirmed'", (object_id,)
+        ).fetchone() is not None
+
     def _snapshot(self, conn, object_id, actor):
         row = self._object(conn, object_id)
         snapshot = {
             "object": dict(row),
             "events": [dict(x) for x in conn.execute("SELECT * FROM events WHERE object_id=? ORDER BY id", (object_id,)).fetchall()],
             "claims": [dict(x) for x in conn.execute("SELECT * FROM claims WHERE object_id=? ORDER BY id", (object_id,)).fetchall()],
+            "handovers": self._handover_list(conn, object_id),
         }
         conn.execute(
             "INSERT INTO object_versions(object_id,version,snapshot,changed_by,created_at) VALUES(?,?,?,?,?)",
@@ -307,10 +340,107 @@ class ProvenanceStore:
                 conn.rollback()
                 raise
 
+    def register_handover(self, user_id, object_id, claim_id, recipient, handover_date, evidence_ids, note=""):
+        recipient = str(recipient).strip()
+        if not recipient:
+            raise BusinessError("受领人不能为空", 422, "invalid_recipient")
+        try:
+            handover_day = date.fromisoformat(str(handover_date).strip())
+        except ValueError:
+            raise BusinessError("交接日期必须是 YYYY-MM-DD", 422, "invalid_date")
+        with self.connect() as conn:
+            self._user(conn, user_id, {"staff"})
+            self._object(conn, object_id)
+            claim = conn.execute("SELECT * FROM claims WHERE id=? AND object_id=?", (claim_id, object_id)).fetchone()
+            if not claim:
+                raise BusinessError("权利主张不存在", 404, "claim_not_found")
+            if claim["status"] != "resolved_return":
+                raise BusinessError("主张尚未达成返还决议，不能登记交割", 409, "claim_not_resolved")
+            if self._is_returned(conn, object_id):
+                raise BusinessError("藏品已返还，不能重复登记交割", 409, "already_returned")
+            if not isinstance(evidence_ids, list) or not evidence_ids:
+                raise BusinessError("交割单据至少关联一份内部证据", 422, "evidence_required")
+            linked = []
+            for evidence_id in evidence_ids:
+                ev = conn.execute("SELECT * FROM evidence WHERE id=? AND object_id=?", (evidence_id, object_id)).fetchone()
+                if not ev:
+                    raise BusinessError("证据不存在或不属于该藏品", 404, "evidence_not_found")
+                if ev["visibility"] != "internal":
+                    raise BusinessError("交割单据只能关联内部证据", 422, "evidence_not_internal")
+                linked.append(ev["id"])
+            if handover_day < date.fromisoformat(claim["created_at"][:10]):
+                raise BusinessError("交接日期不能早于主张提交日", 422, "date_before_claim")
+            cur = conn.execute(
+                """INSERT INTO handovers(object_id,claim_id,recipient,handover_date,note,registered_by,created_at)
+                   VALUES(?,?,?,?,?,?,?)""",
+                (object_id, claim["id"], recipient, handover_day.isoformat(), str(note).strip(), user_id, now()),
+            )
+            handover_id = cur.lastrowid
+            conn.executemany(
+                "INSERT INTO handover_evidence(handover_id,evidence_id) VALUES(?,?)",
+                [(handover_id, eid) for eid in dict.fromkeys(linked)],
+            )
+            self._audit(conn, object_id, user_id, "handover.register",
+                        {"handover_id": handover_id, "claim_id": claim["id"], "evidence_ids": linked})
+            return {"id": handover_id, "object_id": object_id, "claim_id": claim["id"], "status": "pending"}
+
+    def _handover_result(self, conn, handover, already_confirmed=False):
+        obj = self._object(conn, handover["object_id"])
+        result = dict(handover) | {
+            "evidence_ids": [r["evidence_id"] for r in conn.execute(
+                "SELECT evidence_id FROM handover_evidence WHERE handover_id=? ORDER BY evidence_id", (handover["id"],)).fetchall()],
+            "object_version": obj["version"],
+        }
+        if already_confirmed:
+            result["already_confirmed"] = True
+        return result
+
+    def confirm_handover(self, user_id, handover_id, note=""):
+        with self.connect() as conn:
+            self._user(conn, user_id, {"reviewer"})
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                handover = conn.execute("SELECT * FROM handovers WHERE id=?", (handover_id,)).fetchone()
+                if not handover:
+                    raise BusinessError("交割单据不存在", 404, "not_found")
+                if handover["status"] == "confirmed":
+                    # 并发或重复确认：后到者直接拿到已有结果，持有人不再变动。
+                    return self._handover_result(conn, handover, already_confirmed=True)
+                if handover["registered_by"] == user_id:
+                    raise BusinessError("登记人不能确认自己的交割单据", 409, "self_confirm")
+                if self._is_returned(conn, handover["object_id"]):
+                    raise BusinessError("藏品已返还，不能重复交割", 409, "already_returned")
+                conn.execute(
+                    "UPDATE handovers SET status='confirmed',confirmed_by=?,confirm_note=?,confirmed_at=? WHERE id=?",
+                    (user_id, str(note).strip(), now(), handover_id),
+                )
+                obj = self._object(conn, handover["object_id"])
+                new_version = obj["version"] + 1
+                conn.execute(
+                    "UPDATE objects SET current_holder=?,version=?,updated_at=? WHERE id=?",
+                    (handover["recipient"], new_version, now(), handover["object_id"]),
+                )
+                self._snapshot(conn, handover["object_id"], user_id)
+                self._audit(conn, handover["object_id"], user_id, "handover.confirm",
+                            {"handover_id": handover_id, "recipient": handover["recipient"], "object_version": new_version})
+                confirmed = conn.execute("SELECT * FROM handovers WHERE id=?", (handover_id,)).fetchone()
+                return self._handover_result(conn, confirmed)
+            except Exception:
+                conn.rollback()
+                raise
+
+    def list_handovers(self, user_id, object_id):
+        with self.connect() as conn:
+            self._user(conn, user_id, {"staff", "reviewer"})
+            self._object(conn, object_id)
+            return self._handover_list(conn, object_id)
+
     def get_object(self, user_id, object_id):
         with self.connect() as conn:
             user = self._user(conn, user_id)
             obj = self._object(conn, object_id)
+            returned = self._is_returned(conn, object_id)
+            display = {"returned": returned, "display_status": "已返还" if returned else "在馆"}
             if user["role"] == "public":
                 events = conn.execute(
                     "SELECT id,event_type,date_start,date_end,place,description,visibility,created_at FROM events WHERE object_id=? AND visibility='public' ORDER BY id",
@@ -319,15 +449,18 @@ class ProvenanceStore:
                 claims = conn.execute(
                     "SELECT id,claimed_by,desired_outcome,status,created_at FROM claims WHERE object_id=? ORDER BY id", (object_id,)
                 ).fetchall()
+                # 公众只看到“已返还”状态；受领人、交割证据和审查说明一律不公开。
                 return {
                     "id": obj["id"], "inventory_no": obj["inventory_no"], "title": obj["title"],
                     "object_type": obj["object_type"], "public_summary": obj["public_summary"], "version": obj["version"],
+                    **display,
                     "events": [dict(e) for e in events], "claims": [dict(c) for c in claims],
                 }
             result = {
                 "id": obj["id"], "inventory_no": obj["inventory_no"], "title": obj["title"],
                 "object_type": obj["object_type"], "current_holder": obj["current_holder"],
                 "public_summary": obj["public_summary"], "version": obj["version"],
+                **display,
                 "events": [dict(x) | {"source": dict(conn.execute("SELECT id,name,source_type,reference FROM sources WHERE id=?", (x["source_id"],)).fetchone()) if x["source_id"] else None,
                                      "evidence": [dict(e) for e in conn.execute("SELECT id,filename,sha256,size,visibility FROM evidence WHERE event_id=? ORDER BY id", (x["id"],)).fetchall()]}
                             for x in conn.execute("SELECT * FROM events WHERE object_id=? ORDER BY id", (object_id,)).fetchall()],
@@ -335,6 +468,9 @@ class ProvenanceStore:
                            for c in conn.execute("SELECT * FROM claims WHERE object_id=? ORDER BY id", (object_id,)).fetchall()],
                 "unlinked_evidence": [dict(e) for e in conn.execute("SELECT id,filename,sha256,size,visibility FROM evidence WHERE object_id=? AND event_id IS NULL ORDER BY id", (object_id,)).fetchall()],
             }
+            if user["role"] in {"staff", "reviewer"}:
+                # 交割细节（受领人、证据、审查说明）仅内部角色可见。
+                result["handovers"] = self._handover_list(conn, object_id)
             if user["role"] == "claimant":
                 # 主张人只看到公开来源事件和自己的主张，不能浏览内部调查材料。
                 result["events"] = [e for e in result["events"] if e["visibility"] == "public"]
@@ -351,7 +487,12 @@ class ProvenanceStore:
                 rows = conn.execute("SELECT id,inventory_no,title,object_type,public_summary,version FROM objects ORDER BY id").fetchall()
             else:
                 rows = conn.execute("SELECT * FROM objects ORDER BY id").fetchall()
-            return [dict(r) for r in rows]
+            returned_ids = {r["object_id"] for r in conn.execute("SELECT object_id FROM handovers WHERE status='confirmed'").fetchall()}
+            return [
+                dict(r) | {"returned": r["id"] in returned_ids,
+                           "display_status": "已返还" if r["id"] in returned_ids else "在馆"}
+                for r in rows
+            ]
 
     def object_history(self, user_id, object_id):
         with self.connect() as conn:
@@ -422,10 +563,15 @@ class Handler(BaseHTTPRequestHandler):
                 d = self._body(); return self._send(201, store.upload_evidence(user, object_id, d.get("filename", ""), d.get("content_b64", ""), d.get("visibility", "internal"), d.get("event_id")))
             if len(parts) == 4 and parts[3] == "claims" and method == "POST":
                 d = self._body(); return self._send(201, store.create_claim(user, object_id, d.get("claimed_by", ""), d.get("desired_outcome", "")))
+            if len(parts) == 4 and parts[3] == "handovers" and method == "GET": return self._send(200, {"items": store.list_handovers(user, object_id)})
+            if len(parts) == 4 and parts[3] == "handovers" and method == "POST":
+                d = self._body(); return self._send(201, store.register_handover(user, object_id, d.get("claim_id"), d.get("recipient", ""), d.get("handover_date", ""), d.get("evidence_ids", []), d.get("note", "")))
             if len(parts) == 4 and parts[3] == "history" and method == "GET": return self._send(200, {"items": store.object_history(user, object_id)})
             if len(parts) == 5 and parts[3] == "history" and method == "GET": return self._send(200, store.history_detail(user, object_id, int(parts[4])))
         if len(parts) == 4 and parts[:2] == ["api", "claims"] and parts[3] == "transition" and method == "POST":
             d = self._body(); return self._send(200, store.transition_claim(user, int(parts[2]), d.get("status", ""), d.get("note", "")))
+        if len(parts) == 4 and parts[:2] == ["api", "handovers"] and parts[3] == "confirm" and method == "POST":
+            d = self._body(); return self._send(200, store.confirm_handover(user, int(parts[2]), d.get("note", "")))
         raise BusinessError("接口不存在", 404, "not_found")
 
     def _handle(self, method):
